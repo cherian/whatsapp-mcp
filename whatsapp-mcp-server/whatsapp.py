@@ -1,4 +1,6 @@
+import os
 import sqlite3
+import sys
 from datetime import datetime
 from dataclasses import dataclass
 from typing import Optional, List, Tuple
@@ -7,8 +9,28 @@ import requests
 import json
 import audio
 
-MESSAGES_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'whatsapp-bridge', 'store', 'messages.db')
+# Overridable so a) an integration test can point at a fixture DB, b) the
+# bridge's WA_STORE_DIR override (see whatsapp-bridge/main.go) can be mirrored
+# here without also editing this constant.
+MESSAGES_DB_PATH = os.environ.get(
+    "WHATSAPP_MESSAGES_DB",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'whatsapp-bridge', 'store', 'messages.db'),
+)
 WHATSAPP_API_BASE_URL = "http://localhost:8080/api"
+
+# (connect timeout, read timeout) for every call to the bridge's REST API.
+_REQUEST_TIMEOUT = (3, 30)
+
+
+def _connect_ro() -> sqlite3.Connection:
+    """Open messages.db read-only. This process never writes to it -- the Go
+    bridge is the sole writer -- and mode=ro (OS-level read-only open) plus
+    PRAGMA query_only (belt-and-suspenders at the SQLite layer) makes that a
+    guarantee rather than a convention. mode=ro also fails fast if the file
+    is missing, instead of sqlite3 silently creating an empty one."""
+    conn = sqlite3.connect(f"file:{MESSAGES_DB_PATH}?mode=ro", uri=True, timeout=5)
+    conn.execute("PRAGMA query_only = ON")
+    return conn
 
 @dataclass
 class Message:
@@ -20,6 +42,23 @@ class Message:
     id: str
     chat_name: Optional[str] = None
     media_type: Optional[str] = None
+
+
+def _message_to_dict(m: "Message") -> dict:
+    """Structured record for the list_messages MCP tool -- what
+    chat_synopsis.adapters.whatsapp.WhatsAppAdapter actually parses. The
+    field names and timestamp shape (ISO-8601) match that parser exactly;
+    do not rename these without also updating the adapter."""
+    return {
+        "id": m.id,
+        "chat_jid": m.chat_jid,
+        "chat_name": m.chat_name,
+        "sender": m.sender,
+        "timestamp": m.timestamp.isoformat(),
+        "content": m.content,
+        "is_from_me": m.is_from_me,
+        "media_type": m.media_type,
+    }
 
 @dataclass
 class Chat:
@@ -49,7 +88,7 @@ class MessageContext:
 
 def get_sender_name(sender_jid: str) -> str:
     try:
-        conn = sqlite3.connect(MESSAGES_DB_PATH)
+        conn = _connect_ro()
         cursor = conn.cursor()
         
         # First try matching by exact JID
@@ -85,7 +124,7 @@ def get_sender_name(sender_jid: str) -> str:
             return sender_jid
         
     except sqlite3.Error as e:
-        print(f"Database error while getting sender name: {e}")
+        print(f"Database error while getting sender name: {e}", file=sys.stderr)
         return sender_jid
     finally:
         if 'conn' in locals():
@@ -108,17 +147,7 @@ def format_message(message: Message, show_chat_info: bool = True) -> None:
         sender_name = get_sender_name(message.sender) if not message.is_from_me else "Me"
         output += f"From: {sender_name}: {content_prefix}{message.content}\n"
     except Exception as e:
-        print(f"Error formatting message: {e}")
-    return output
-
-def format_messages_list(messages: List[Message], show_chat_info: bool = True) -> None:
-    output = ""
-    if not messages:
-        output += "No messages to display."
-        return output
-    
-    for message in messages:
-        output += format_message(message, show_chat_info)
+        print(f"Error formatting message: {e}", file=sys.stderr)
     return output
 
 def list_messages(
@@ -132,10 +161,10 @@ def list_messages(
     include_context: bool = True,
     context_before: int = 1,
     context_after: int = 1
-) -> List[Message]:
+) -> List[dict]:
     """Get messages matching the specified criteria with optional context."""
     try:
-        conn = sqlite3.connect(MESSAGES_DB_PATH)
+        conn = _connect_ro()
         cursor = conn.cursor()
         
         # Build base query
@@ -210,14 +239,17 @@ def list_messages(
                 messages_with_context.append(context.message)
                 messages_with_context.extend(context.after)
             
-            return format_messages_list(messages_with_context, show_chat_info=True)
+            return [_message_to_dict(m) for m in messages_with_context]
             
-        # Format and display messages without context
-        return format_messages_list(result, show_chat_info=True)    
+        # Structured records, not a formatted string -- this is what the
+        # `list_messages` MCP tool's declared List[Dict[str, Any]] return
+        # type in main.py actually promised, and what the chat-synopsis
+        # adapter requires.
+        return [_message_to_dict(m) for m in result]    
         
     except sqlite3.Error as e:
-        print(f"Database error: {e}")
-        return []
+        print(f"Database error: {e}", file=sys.stderr)
+        raise
     finally:
         if 'conn' in locals():
             conn.close()
@@ -230,7 +262,7 @@ def get_message_context(
 ) -> MessageContext:
     """Get context around a specific message."""
     try:
-        conn = sqlite3.connect(MESSAGES_DB_PATH)
+        conn = _connect_ro()
         cursor = conn.cursor()
         
         # Get the target message first
@@ -309,7 +341,7 @@ def get_message_context(
         )
         
     except sqlite3.Error as e:
-        print(f"Database error: {e}")
+        print(f"Database error: {e}", file=sys.stderr)
         raise
     finally:
         if 'conn' in locals():
@@ -325,26 +357,39 @@ def list_chats(
 ) -> List[Chat]:
     """Get chats matching the specified criteria."""
     try:
-        conn = sqlite3.connect(MESSAGES_DB_PATH)
+        conn = _connect_ro()
         cursor = conn.cursor()
         
-        # Build base query
-        query_parts = ["""
-            SELECT 
-                chats.jid,
-                chats.name,
-                chats.last_message_time,
-                messages.content as last_message,
-                messages.sender as last_sender,
-                messages.is_from_me as last_is_from_me
-            FROM chats
-        """]
-        
+        # Build base query. The last_message/last_sender/last_is_from_me
+        # columns only exist in the SELECT list when the LEFT JOIN that
+        # produces them is actually present -- referencing messages.* without
+        # the JOIN is a "no such column" SQL error, not a graceful empty
+        # value, and this is the path the chat-synopsis adapter always uses
+        # (it calls list_chats with include_last_message=False).
         if include_last_message:
-            query_parts.append("""
+            query_parts = ["""
+                SELECT 
+                    chats.jid,
+                    chats.name,
+                    chats.last_message_time,
+                    messages.content as last_message,
+                    messages.sender as last_sender,
+                    messages.is_from_me as last_is_from_me
+                FROM chats
                 LEFT JOIN messages ON chats.jid = messages.chat_jid 
-                AND chats.last_message_time = messages.timestamp
-            """)
+                    AND chats.last_message_time = messages.timestamp
+            """]
+        else:
+            query_parts = ["""
+                SELECT 
+                    chats.jid,
+                    chats.name,
+                    chats.last_message_time,
+                    NULL as last_message,
+                    NULL as last_sender,
+                    NULL as last_is_from_me
+                FROM chats
+            """]
             
         where_clauses = []
         params = []
@@ -383,8 +428,8 @@ def list_chats(
         return result
         
     except sqlite3.Error as e:
-        print(f"Database error: {e}")
-        return []
+        print(f"Database error: {e}", file=sys.stderr)
+        raise
     finally:
         if 'conn' in locals():
             conn.close()
@@ -393,7 +438,7 @@ def list_chats(
 def search_contacts(query: str) -> List[Contact]:
     """Search contacts by name or phone number."""
     try:
-        conn = sqlite3.connect(MESSAGES_DB_PATH)
+        conn = _connect_ro()
         cursor = conn.cursor()
         
         # Split query into characters to support partial matching
@@ -425,8 +470,8 @@ def search_contacts(query: str) -> List[Contact]:
         return result
         
     except sqlite3.Error as e:
-        print(f"Database error: {e}")
-        return []
+        print(f"Database error: {e}", file=sys.stderr)
+        raise
     finally:
         if 'conn' in locals():
             conn.close()
@@ -441,7 +486,7 @@ def get_contact_chats(jid: str, limit: int = 20, page: int = 0) -> List[Chat]:
         page: Page number for pagination (default 0)
     """
     try:
-        conn = sqlite3.connect(MESSAGES_DB_PATH)
+        conn = _connect_ro()
         cursor = conn.cursor()
         
         cursor.execute("""
@@ -476,8 +521,8 @@ def get_contact_chats(jid: str, limit: int = 20, page: int = 0) -> List[Chat]:
         return result
         
     except sqlite3.Error as e:
-        print(f"Database error: {e}")
-        return []
+        print(f"Database error: {e}", file=sys.stderr)
+        raise
     finally:
         if 'conn' in locals():
             conn.close()
@@ -486,7 +531,7 @@ def get_contact_chats(jid: str, limit: int = 20, page: int = 0) -> List[Chat]:
 def get_last_interaction(jid: str) -> str:
     """Get most recent message involving the contact."""
     try:
-        conn = sqlite3.connect(MESSAGES_DB_PATH)
+        conn = _connect_ro()
         cursor = conn.cursor()
         
         cursor.execute("""
@@ -525,8 +570,8 @@ def get_last_interaction(jid: str) -> str:
         return format_message(message)
         
     except sqlite3.Error as e:
-        print(f"Database error: {e}")
-        return None
+        print(f"Database error: {e}", file=sys.stderr)
+        raise
     finally:
         if 'conn' in locals():
             conn.close()
@@ -535,24 +580,34 @@ def get_last_interaction(jid: str) -> str:
 def get_chat(chat_jid: str, include_last_message: bool = True) -> Optional[Chat]:
     """Get chat metadata by JID."""
     try:
-        conn = sqlite3.connect(MESSAGES_DB_PATH)
+        conn = _connect_ro()
         cursor = conn.cursor()
         
-        query = """
-            SELECT 
-                c.jid,
-                c.name,
-                c.last_message_time,
-                m.content as last_message,
-                m.sender as last_sender,
-                m.is_from_me as last_is_from_me
-            FROM chats c
-        """
-        
+        # Same fix as list_chats: m.* only in the SELECT list when the JOIN
+        # producing it is present.
         if include_last_message:
-            query += """
+            query = """
+                SELECT 
+                    c.jid,
+                    c.name,
+                    c.last_message_time,
+                    m.content as last_message,
+                    m.sender as last_sender,
+                    m.is_from_me as last_is_from_me
+                FROM chats c
                 LEFT JOIN messages m ON c.jid = m.chat_jid 
-                AND c.last_message_time = m.timestamp
+                    AND c.last_message_time = m.timestamp
+            """
+        else:
+            query = """
+                SELECT 
+                    c.jid,
+                    c.name,
+                    c.last_message_time,
+                    NULL as last_message,
+                    NULL as last_sender,
+                    NULL as last_is_from_me
+                FROM chats c
             """
             
         query += " WHERE c.jid = ?"
@@ -573,8 +628,8 @@ def get_chat(chat_jid: str, include_last_message: bool = True) -> Optional[Chat]
         )
         
     except sqlite3.Error as e:
-        print(f"Database error: {e}")
-        return None
+        print(f"Database error: {e}", file=sys.stderr)
+        raise
     finally:
         if 'conn' in locals():
             conn.close()
@@ -583,7 +638,7 @@ def get_chat(chat_jid: str, include_last_message: bool = True) -> Optional[Chat]
 def get_direct_chat_by_contact(sender_phone_number: str) -> Optional[Chat]:
     """Get chat metadata by sender phone number."""
     try:
-        conn = sqlite3.connect(MESSAGES_DB_PATH)
+        conn = _connect_ro()
         cursor = conn.cursor()
         
         cursor.execute("""
@@ -616,8 +671,8 @@ def get_direct_chat_by_contact(sender_phone_number: str) -> Optional[Chat]:
         )
         
     except sqlite3.Error as e:
-        print(f"Database error: {e}")
-        return None
+        print(f"Database error: {e}", file=sys.stderr)
+        raise
     finally:
         if 'conn' in locals():
             conn.close()
@@ -634,7 +689,7 @@ def send_message(recipient: str, message: str) -> Tuple[bool, str]:
             "message": message,
         }
         
-        response = requests.post(url, json=payload)
+        response = requests.post(url, json=payload, timeout=_REQUEST_TIMEOUT)
         
         # Check if the request was successful
         if response.status_code == 200:
@@ -668,7 +723,7 @@ def send_file(recipient: str, media_path: str) -> Tuple[bool, str]:
             "media_path": media_path
         }
         
-        response = requests.post(url, json=payload)
+        response = requests.post(url, json=payload, timeout=_REQUEST_TIMEOUT)
         
         # Check if the request was successful
         if response.status_code == 200:
@@ -708,7 +763,7 @@ def send_audio_message(recipient: str, media_path: str) -> Tuple[bool, str]:
             "media_path": media_path
         }
         
-        response = requests.post(url, json=payload)
+        response = requests.post(url, json=payload, timeout=_REQUEST_TIMEOUT)
         
         # Check if the request was successful
         if response.status_code == 200:
@@ -741,27 +796,27 @@ def download_media(message_id: str, chat_jid: str) -> Optional[str]:
             "chat_jid": chat_jid
         }
         
-        response = requests.post(url, json=payload)
+        response = requests.post(url, json=payload, timeout=_REQUEST_TIMEOUT)
         
         if response.status_code == 200:
             result = response.json()
             if result.get("success", False):
                 path = result.get("path")
-                print(f"Media downloaded successfully: {path}")
+                print(f"Media downloaded successfully: {path}", file=sys.stderr)
                 return path
             else:
-                print(f"Download failed: {result.get('message', 'Unknown error')}")
+                print(f"Download failed: {result.get('message', 'Unknown error')}", file=sys.stderr)
                 return None
         else:
-            print(f"Error: HTTP {response.status_code} - {response.text}")
+            print(f"Error: HTTP {response.status_code} - {response.text}", file=sys.stderr)
             return None
             
     except requests.RequestException as e:
-        print(f"Request error: {str(e)}")
+        print(f"Request error: {str(e)}", file=sys.stderr)
         return None
     except json.JSONDecodeError:
-        print(f"Error parsing response: {response.text}")
+        print(f"Error parsing response: {response.text}", file=sys.stderr)
         return None
     except Exception as e:
-        print(f"Unexpected error: {str(e)}")
+        print(f"Unexpected error: {str(e)}", file=sys.stderr)
         return None
