@@ -41,6 +41,17 @@ type Message struct {
 	Filename  string
 }
 
+// storeDir returns the directory the bridge persists its SQLite stores and
+// downloaded media under. Overridable via WA_STORE_DIR so a scratch pairing
+// (A1 spike) can run against a throwaway directory without touching the
+// real session. Defaults to "store" for backward compatibility.
+func storeDir() string {
+	if d := os.Getenv("WA_STORE_DIR"); d != "" {
+		return d
+	}
+	return "store"
+}
+
 // Database handler for storing message history
 type MessageStore struct {
 	db *sql.DB
@@ -49,12 +60,12 @@ type MessageStore struct {
 // Initialize message store
 func NewMessageStore() (*MessageStore, error) {
 	// Create directory for database if it doesn't exist
-	if err := os.MkdirAll("store", 0755); err != nil {
+	if err := os.MkdirAll(storeDir(), 0755); err != nil {
 		return nil, fmt.Errorf("failed to create store directory: %v", err)
 	}
 
 	// Open SQLite database for messages
-	db, err := sql.Open("sqlite3", "file:store/messages.db?_foreign_keys=on")
+	db, err := sql.Open("sqlite3", fmt.Sprintf("file:%s/messages.db?_foreign_keys=on", storeDir()))
 	if err != nil {
 		return nil, fmt.Errorf("failed to open message database: %v", err)
 	}
@@ -562,7 +573,7 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 	var err error
 
 	// First, check if we already have this file
-	chatDir := fmt.Sprintf("store/%s", strings.ReplaceAll(chatJID, ":", "_"))
+	chatDir := fmt.Sprintf("%s/%s", storeDir(), strings.ReplaceAll(chatJID, ":", "_"))
 	localPath := ""
 
 	// Get media info from the database
@@ -641,7 +652,7 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 	}
 
 	// Download the media using whatsmeow client
-	mediaData, err := client.Download(downloader)
+	mediaData, err := client.Download(context.Background(), downloader)
 	if err != nil {
 		return false, "", "", "", fmt.Errorf("failed to download media: %v", err)
 	}
@@ -795,19 +806,19 @@ func main() {
 	dbLog := waLog.Stdout("Database", "INFO", true)
 
 	// Create directory for database if it doesn't exist
-	if err := os.MkdirAll("store", 0755); err != nil {
+	if err := os.MkdirAll(storeDir(), 0755); err != nil {
 		logger.Errorf("Failed to create store directory: %v", err)
 		return
 	}
 
-	container, err := sqlstore.New("sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
+	container, err := sqlstore.New(context.Background(), "sqlite3", fmt.Sprintf("file:%s/whatsapp.db?_foreign_keys=on", storeDir()), dbLog)
 	if err != nil {
 		logger.Errorf("Failed to connect to database: %v", err)
 		return
 	}
 
 	// Get device store - This contains session information
-	deviceStore, err := container.GetFirstDevice()
+	deviceStore, err := container.GetFirstDevice(context.Background())
 	if err != nil {
 		if err == sql.ErrNoRows {
 			// No device exists, create one
@@ -870,7 +881,19 @@ func main() {
 		for evt := range qrChan {
 			if evt.Event == "code" {
 				fmt.Println("\nScan this QR code with your WhatsApp app:")
-				qrterminal.GenerateHalfBlock(evt.Code, qrterminal.L, os.Stdout)
+				// QuietZone: 1 instead of the library default of 4 — shrinks the
+				// printed border substantially so the code fits a normal terminal
+				// width without wrapping. Still scans fine at normal phone distance.
+				qrterminal.GenerateWithConfig(evt.Code, qrterminal.Config{
+					Level:          qrterminal.L,
+					Writer:         os.Stdout,
+					HalfBlocks:     true,
+					BlackChar:      qrterminal.BLACK_BLACK,
+					WhiteChar:      qrterminal.WHITE_WHITE,
+					BlackWhiteChar: qrterminal.BLACK_WHITE,
+					WhiteBlackChar: qrterminal.WHITE_BLACK,
+					QuietZone:      1,
+				})
 			} else if evt.Event == "success" {
 				connected <- true
 				break
@@ -973,7 +996,7 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 
 		// If we didn't get a name, try group info
 		if name == "" {
-			groupInfo, err := client.GetGroupInfo(jid)
+			groupInfo, err := client.GetGroupInfo(context.Background(), jid)
 			if err == nil && groupInfo.Name != "" {
 				name = groupInfo.Name
 			} else {
@@ -988,7 +1011,7 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 		logger.Infof("Getting name for contact: %s", chatJID)
 
 		// Just use contact info (full name)
-		contact, err := client.Store.Contacts.GetContact(jid)
+		contact, err := client.Store.Contacts.GetContact(context.Background(), jid)
 		if err == nil && contact.FullName != "" {
 			name = contact.FullName
 		} else if sender != "" {
