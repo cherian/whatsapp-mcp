@@ -2,6 +2,8 @@
 claude_desktop_config.json
 whatsapp.log
 whatsapp-bridge/whatsapp-bridge
+whatsapp-bridge/whatsapp-bridge.prev-*
 whatsapp-bridge/store/
 whatsapp-bridge/store-scratch/
 whatsapp-bridge/*.log
+scripts/__pycache__/
