@@ -2,14 +2,18 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"math/rand"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -622,9 +626,17 @@ type DownloadMediaRequest struct {
 	ChatJID   string `json:"chat_jid"`
 }
 
-// DownloadMediaResponse represents the response for the download media API
+// DownloadMediaResponse represents the response for the download media API.
+//
+// Code is a stable, machine-readable outcome (see classifyMediaCode):
+// "ok", "not_media", "expired", "incomplete", "offline", or "internal".
+// Every APPLICATION-level outcome (not_media/expired/incomplete) is
+// returned with HTTP 200 and success:false, since the Python caller only
+// parses the JSON body on a 200 response -- only genuine transport/server
+// problems (offline: 503, internal: 500) use a non-200 status.
 type DownloadMediaResponse struct {
 	Success  bool   `json:"success"`
+	Code     string `json:"code"`
 	Message  string `json:"message"`
 	Filename string `json:"filename,omitempty"`
 	Path     string `json:"path,omitempty"`
@@ -699,6 +711,51 @@ func (d *MediaDownloader) GetMediaType() whatsmeow.MediaType {
 	return d.MediaType
 }
 
+// mediaDownloadTimeout bounds a single media download+decrypt, replacing
+// the previous context.Background() (no deadline at all). whatsmeow's
+// media HTTP client has no overall timeout of its own, and the REST/MCP
+// callers give up around 30s -- this is deliberately much longer than
+// that so a slow-but-succeeding download over a real connection (the
+// largest known in-window file today is ~740MB) isn't killed early, while
+// still guaranteeing a stalled connection eventually releases its
+// resources instead of hanging forever.
+const mediaDownloadTimeout = 10 * time.Minute
+
+// archiveFilename returns the on-disk name for a message's media, unique
+// by construction within its chat directory: "<safe message ID>-<safe
+// display name>". The message ID is the actual uniqueness key (it's the
+// messages table's own primary-key component alongside chat_jid); the
+// display name is cosmetic only.
+//
+// Codex-flagged (2026-09-15 review): a raw message ID is not automatically
+// a safe filesystem key -- history sync can in principle hand back an
+// empty one, and IDs aren't charset-validated on the way in. An empty ID
+// is refused outright (there is nothing unique left to key on); anything
+// outside a conservative safe charset is replaced with its SHA-256 hex
+// digest rather than trusted verbatim, so it can never inject a path
+// separator, a "..", or collide via case-folding on a case-insensitive
+// filesystem.
+func archiveFilename(messageID, displayName string) (string, error) {
+	if messageID == "" {
+		return "", fmt.Errorf("refusing empty message ID for media filename")
+	}
+	safeID := messageID
+	for _, r := range messageID {
+		isSafe := (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '-' || r == '_' || r == '.'
+		if !isSafe {
+			sum := sha256.Sum256([]byte(messageID))
+			safeID = hex.EncodeToString(sum[:])
+			break
+		}
+	}
+
+	safeName := filepath.Base(displayName)
+	if safeName == "" || safeName == "." || safeName == ".." || strings.ContainsAny(safeName, "/\\") {
+		safeName = "media"
+	}
+	return safeID + "-" + safeName, nil
+}
+
 // Function to download media from a message
 func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, messageID, chatJID string) (bool, string, string, string, error) {
 	// Query the database for the message
@@ -728,7 +785,7 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 
 	// Check if this is a media message
 	if mediaType == "" {
-		return false, "", "", "", fmt.Errorf("not a media message")
+		return false, "", "", "", ErrNotMediaMessage
 	}
 
 	// Create directory for the chat if it doesn't exist
@@ -736,13 +793,17 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 		return false, "", "", "", fmt.Errorf("failed to create chat directory: %v", err)
 	}
 
-	// filename comes from the sender (a DocumentMessage's FileName field, or
-	// similar) and is untrusted. filepath.Base strips any directory
-	// components; the resolved-path check below is the real guard against a
-	// crafted "../../something" filename escaping chatDir.
-	safeName := filepath.Base(filename)
-	if safeName == "" || safeName == "." || safeName == ".." || strings.ContainsAny(safeName, "/\\") {
-		return false, "", "", "", fmt.Errorf("refusing unsafe media filename: %q", filename)
+	// Bug fixed 2026-09-15: the on-disk name used to be the sender-supplied
+	// filename alone, generated from time.Now() at ingest -- 80% of media
+	// rows collided on (chat_jid, filename) in production (one filename
+	// mapped to 225 distinct messages), so archiving would have files
+	// overwrite each other and serve the WRONG media on a cache hit. The
+	// message ID (unique under the messages table's own (id, chat_jid)
+	// primary key) is now the actual key; the human filename is kept only
+	// for the returned display name and as a readability suffix on disk.
+	safeName, err := archiveFilename(messageID, filename)
+	if err != nil {
+		return false, "", "", "", err
 	}
 
 	// Generate a local path for the file
@@ -764,21 +825,33 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 		return false, "", "", "", fmt.Errorf("refusing media path outside chat directory: %q", localPath)
 	}
 
-	// Check if file already exists
-	if _, err := os.Stat(localPath); err == nil {
-		// File exists, return it
-		return true, mediaType, filename, absPath, nil
+	// Bug fixed 2026-09-15: a bare os.Stat "it exists, return it" cache
+	// check let a partial/truncated write (a prior crash, disk-full mid
+	// write) read as successfully archived forever after. Require the
+	// file to also match the DB's own recorded length when that length is
+	// known (fileLength is 0 on the "basic info" fallback query path
+	// above, which doesn't select it -- degrade to existence-only there,
+	// same as before, rather than block on info we don't have).
+	if info, statErr := os.Stat(localPath); statErr == nil {
+		if fileLength == 0 || uint64(info.Size()) == fileLength {
+			return true, mediaType, filename, absPath, nil
+		}
+		fmt.Printf("Cached media for %s/%s is %d bytes, expected %d -- re-downloading\n", chatJID, messageID, info.Size(), fileLength)
 	}
 
 	// If we don't have all the media info we need, we can't download
 	if url == "" || len(mediaKey) == 0 || len(fileSHA256) == 0 || len(fileEncSHA256) == 0 || fileLength == 0 {
-		return false, "", "", "", fmt.Errorf("incomplete media information for download")
+		return false, "", "", "", fmt.Errorf("%w: message %s in chat %s", ErrMediaIncomplete, messageID, chatJID)
 	}
 
 	fmt.Printf("Attempting to download media for message %s in chat %s...\n", messageID, chatJID)
 
-	// Extract direct path from URL
-	directPath := extractDirectPathFromURL(url)
+	// Extract direct path from URL -- see directPathFromURL's docstring
+	// for why the query string must be preserved byte-for-byte.
+	directPath, err := directPathFromURL(url)
+	if err != nil {
+		return false, "", "", "", fmt.Errorf("failed to derive direct path: %w", err)
+	}
 
 	// Create a downloader that implements DownloadableMessage
 	var waMediaType whatsmeow.MediaType
@@ -805,40 +878,144 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 		MediaType:     waMediaType,
 	}
 
-	// Download the media using whatsmeow client
-	mediaData, err := client.Download(context.Background(), downloader)
+	// Codex-flagged (2026-09-15 review): client.Download buffers the
+	// COMPLETE ciphertext AND plaintext in memory, with no timeout of its
+	// own -- a single large file (the largest in-window item at review
+	// time was a 739.7MB document) means ~1.5GB of RAM for one download,
+	// and a stalled connection under context.Background() never gives up.
+	// DownloadToFile streams straight to disk (whatsmeow still does full
+	// SHA-256 verification of both the ciphertext and the decrypted
+	// plaintext, just against the file instead of an in-memory buffer),
+	// and an explicit deadline replaces context.Background().
+	//
+	// Written to a temp file in chatDir (not localPath directly) and
+	// renamed into place only on full success: a crash, disk-full
+	// condition, or timeout partway through must never leave something at
+	// localPath that the cache-hit check above could mistake for a
+	// complete, valid archive.
+	ctx, cancel := context.WithTimeout(context.Background(), mediaDownloadTimeout)
+	defer cancel()
+
+	tmpPath := localPath + ".tmp-" + fmt.Sprint(os.Getpid())
+	tmpFile, err := os.OpenFile(tmpPath, os.O_RDWR|os.O_CREATE|os.O_TRUNC|os.O_EXCL, 0600)
 	if err != nil {
-		return false, "", "", "", fmt.Errorf("failed to download media: %v", err)
+		return false, "", "", "", fmt.Errorf("failed to create temp file for media download: %w", err)
+	}
+	defer func() {
+		tmpFile.Close()
+		os.Remove(tmpPath) // no-op once successfully renamed away
+	}()
+
+	// %w (not %v): callers need to errors.Is() against whatsmeow's
+	// ErrMediaDownloadFailedWith403/404/410 to distinguish "permanently
+	// expired" from every other failure mode.
+	if err := client.DownloadToFile(ctx, downloader, tmpFile); err != nil {
+		return false, "", "", "", fmt.Errorf("failed to download media: %w", err)
+	}
+	if err := tmpFile.Close(); err != nil {
+		return false, "", "", "", fmt.Errorf("failed to finalize media download: %w", err)
+	}
+	if err := os.Rename(tmpPath, localPath); err != nil {
+		return false, "", "", "", fmt.Errorf("failed to move downloaded media into place: %w", err)
 	}
 
-	// Save the downloaded media to file. 0600: other people's photos/documents
-	// are not world-readable on this machine.
-	if err := os.WriteFile(localPath, mediaData, 0600); err != nil {
-		return false, "", "", "", fmt.Errorf("failed to save media file: %v", err)
-	}
-
-	fmt.Printf("Successfully downloaded %s media to %s (%d bytes)\n", mediaType, absPath, len(mediaData))
+	fmt.Printf("Successfully downloaded %s media to %s\n", mediaType, absPath)
 	return true, mediaType, filename, absPath, nil
 }
 
-// Extract direct path from a WhatsApp media URL
-func extractDirectPathFromURL(url string) string {
-	// The direct path is typically in the URL, we need to extract it
-	// Example URL: https://mmg.whatsapp.net/v/t62.7118-24/13812002_698058036224062_3424455886509161511_n.enc?ccb=11-4&oh=...
+// ErrMediaURLMissingQuery is returned by directPathFromURL when the stored
+// URL has no query string at all -- whatsmeow's downloader appends
+// "&hash=..." to the direct path, which can never produce a validly signed
+// request without a query to append to. No such row exists in the DB today
+// (confirmed: 100% of stored URLs across both known shapes carry a query),
+// but a future WhatsApp URL format change should fail loudly here rather
+// than issue a request guaranteed to 403.
+var ErrMediaURLMissingQuery = errors.New("media URL has no query string")
 
-	// Find the path part after the domain
-	parts := strings.SplitN(url, ".net/", 2)
-	if len(parts) < 2 {
-		return url // Return original URL if parsing fails
+// Sentinel errors classified by classifyMediaCode, so the /api/download
+// response can tell the Python/MCP caller "not a media message" from
+// "media permanently expired" from "bridge not connected" from an
+// internal error -- previously every failure mode collapsed into the
+// same opaque "Failed to download media" with no machine-readable code
+// at all.
+var (
+	ErrNotMediaMessage = errors.New("not a media message")
+	ErrMediaIncomplete = errors.New("incomplete media information for download")
+)
+
+// classifyMediaCode maps a downloadMedia error to a stable, machine-readable
+// code for the /api/download response. Relies on %w wrapping throughout
+// downloadMedia (and on whatsmeow's own ErrMediaDownloadFailedWith403/404
+// /410/ErrNoURLPresent being real sentinels) so errors.Is works through
+// however many layers of fmt.Errorf wrap the original cause.
+func classifyMediaCode(err error) string {
+	switch {
+	case err == nil:
+		return "ok"
+	case errors.Is(err, ErrNotMediaMessage):
+		return "not_media"
+	case errors.Is(err, ErrMediaIncomplete), errors.Is(err, whatsmeow.ErrNoURLPresent):
+		return "incomplete"
+	case errors.Is(err, whatsmeow.ErrMediaDownloadFailedWith403),
+		errors.Is(err, whatsmeow.ErrMediaDownloadFailedWith404),
+		errors.Is(err, whatsmeow.ErrMediaDownloadFailedWith410):
+		return "expired"
+	default:
+		return "internal"
+	}
+}
+
+// directPathFromURL derives a whatsmeow direct path from a stored CDN URL.
+//
+// Root cause of the original 403 bug: the previous implementation
+// (extractDirectPathFromURL) stripped the query string via string
+// splitting. whatsmeow's DownloadMediaWithPath appends "&hash=...&..." to
+// this string (not "?hash=..."), so the direct path MUST retain its
+// original query byte-for-byte, or the resulting request is unsigned and
+// the CDN returns 403. Confirmed by live probe: the stored URL as-is
+// returns 200; the query-stripped-then-&-appended form returns 403.
+//
+// This uses net/url to VALIDATE the URL shape, but reconstructs the path
+// from EscapedPath()+"?"+RawQuery rather than any of u.String(),
+// u.Query().Encode(), or u.RequestURI() re-encoding the whole URL --
+// each of those can decode/re-escape path segments, reorder query
+// parameters, or normalise "+" encoding, any of which can invalidate the
+// CDN's signature just as thoroughly as stripping the query outright.
+// RawQuery is never touched.
+func directPathFromURL(rawURL string) (string, error) {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return "", fmt.Errorf("unparseable media URL: %w", err)
+	}
+	if u.Scheme != "https" {
+		return "", fmt.Errorf("media URL is not https: %q", rawURL)
+	}
+	if u.Host == "" {
+		return "", fmt.Errorf("media URL has no host: %q", rawURL)
+	}
+	if u.User != nil {
+		return "", fmt.Errorf("media URL must not carry userinfo: %q", rawURL)
+	}
+	if u.Fragment != "" {
+		return "", fmt.Errorf("media URL must not carry a fragment: %q", rawURL)
+	}
+	if u.EscapedPath() == "" {
+		return "", fmt.Errorf("media URL has no path: %q", rawURL)
+	}
+	if u.RawQuery == "" {
+		return "", fmt.Errorf("%w: %q", ErrMediaURLMissingQuery, rawURL)
 	}
 
-	pathPart := parts[1]
-
-	// Remove query parameters
-	pathPart = strings.SplitN(pathPart, "?", 2)[0]
-
-	// Create proper direct path format
-	return "/" + pathPart
+	directPath := u.EscapedPath() + "?" + u.RawQuery
+	if !strings.HasPrefix(directPath, "/") {
+		// whatsmeow's DownloadMediaWithPath rejects a direct path that
+		// doesn't start with "/" -- EscapedPath() always includes the
+		// leading slash for an absolute URL, so this should be
+		// unreachable, but fail explicitly rather than silently issuing
+		// a request whatsmeow itself would refuse.
+		return "", fmt.Errorf("derived direct path does not start with '/': %q", directPath)
+	}
+	return directPath, nil
 }
 
 // Start a REST API server to expose the WhatsApp client functionality.
@@ -921,11 +1098,25 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 			return
 		}
 
+		w.Header().Set("Content-Type", "application/json")
+
+		// A download attempted while not connected to WhatsApp can't
+		// succeed regardless of the message -- classify it distinctly
+		// (and as a real HTTP error, 503) rather than let it fall
+		// through to downloadMedia and surface as an opaque "internal"
+		// failure indistinguishable from a real bug.
+		if client == nil || !client.IsConnected() {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			json.NewEncoder(w).Encode(DownloadMediaResponse{
+				Success: false,
+				Code:    "offline",
+				Message: "not connected to WhatsApp",
+			})
+			return
+		}
+
 		// Download the media
 		success, mediaType, filename, path, err := downloadMedia(client, messageStore, req.MessageID, req.ChatJID)
-
-		// Set response headers
-		w.Header().Set("Content-Type", "application/json")
 
 		// Handle download result
 		if !success || err != nil {
@@ -933,10 +1124,23 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 			if err != nil {
 				errMsg = err.Error()
 			}
+			code := classifyMediaCode(err)
 
-			w.WriteHeader(http.StatusInternalServerError)
+			// Codex-flagged (2026-09-15 review): application-level
+			// outcomes (not_media/expired/incomplete) are real, expected
+			// results, not server errors -- HTTP 200 so
+			// whatsapp.py:download_media (which only parses the JSON
+			// body on a 200 response) can read the Code field at all.
+			// Only a genuine internal failure gets a 500.
+			status := http.StatusOK
+			if code == "internal" {
+				status = http.StatusInternalServerError
+			}
+
+			w.WriteHeader(status)
 			json.NewEncoder(w).Encode(DownloadMediaResponse{
 				Success: false,
+				Code:    code,
 				Message: fmt.Sprintf("Failed to download media: %s", errMsg),
 			})
 			return
@@ -945,6 +1149,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		// Send successful response
 		json.NewEncoder(w).Encode(DownloadMediaResponse{
 			Success:  true,
+			Code:     "ok",
 			Message:  fmt.Sprintf("Successfully downloaded %s media", mediaType),
 			Filename: filename,
 			Path:     path,

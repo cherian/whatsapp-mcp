@@ -232,18 +232,22 @@ def download_media(message_id: str, chat_jid: str) -> Dict[str, Any]:
     Returns:
         A dictionary containing success status, a status message, and the file path if successful
     """
-    file_path = whatsapp_download_media(message_id, chat_jid)
-    
-    if file_path:
+    success, message, file_path = whatsapp_download_media(message_id, chat_jid)
+
+    if success:
         return {
             "success": True,
-            "message": "Media downloaded successfully",
+            "message": message,
             "file_path": file_path
         }
     else:
+        # message is now a specific, actionable reason (e.g. "Media has
+        # expired...", "WhatsApp bridge is not connected...") instead of
+        # the old blanket "Failed to download media" that made every
+        # failure mode indistinguishable to the caller.
         return {
             "success": False,
-            "message": "Failed to download media"
+            "message": message
         }
 
 if __name__ == "__main__":

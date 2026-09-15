@@ -46,11 +46,24 @@ record_event() {
   echo "BRIDGE_EVENT $(date -u +%Y-%m-%dT%H:%M:%SZ) $kind"
 }
 
+PAIR_CHECK_ERRORED=0
+
 is_paired() {
   [ -f "$DEVICE_DB" ] || return 1
   [ ! -f "$LOGGED_OUT_SENTINEL" ] || return 1
   local count
-  count=$(sqlite3 "$DEVICE_DB" "SELECT COUNT(*) FROM whatsmeow_device;" 2>/dev/null || echo 0)
+  if ! count=$(sqlite3 "$DEVICE_DB" "SELECT COUNT(*) FROM whatsmeow_device;" 2>/dev/null); then
+    # Bug fixed 2026-09-15: the old `|| echo 0` fallback made a QUERY
+    # ERROR (e.g. a transient exclusive lock from a concurrent writer --
+    # this DB is journal_mode=delete, not WAL) indistinguishable from a
+    # genuine zero-row table. main() then recorded "unpaired" into
+    # bridge_events -- a trial-fatal event for a downstream uptime
+    # verdict, even though nothing about pairing had actually changed.
+    # Signal "indeterminate" distinctly so the caller retries instead of
+    # persisting false evidence.
+    PAIR_CHECK_ERRORED=1
+    return 1
+  fi
   [ "${count:-0}" -gt 0 ]
 }
 
@@ -98,6 +111,14 @@ main() {
   fi
 
   if ! is_paired; then
+    if [ "$PAIR_CHECK_ERRORED" = "1" ]; then
+      # Query error, not a real pairing state -- do NOT record "unpaired"
+      # (that would be false evidence). Exit non-zero so launchd's
+      # KeepAlive={SuccessfulExit:false} retries in ~30s, when the
+      # transient lock has likely cleared.
+      echo "Could not query $DEVICE_DB (transient error, not a pairing decision) -- retrying via launchd." >&2
+      exit 1
+    fi
     record_event "unpaired"
     echo "No paired device found in $DEVICE_DB -- refusing to start." >&2
     echo "Run: $0 --pair" >&2

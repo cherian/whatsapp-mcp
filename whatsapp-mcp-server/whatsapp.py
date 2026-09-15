@@ -779,15 +779,35 @@ def send_audio_message(recipient: str, media_path: str) -> Tuple[bool, str]:
     except Exception as e:
         return False, f"Unexpected error: {str(e)}"
 
-def download_media(message_id: str, chat_jid: str) -> Optional[str]:
-    """Download media from a message and return the local file path.
-    
+# Human-readable prefixes for each machine-readable `code` the bridge's
+# /api/download can return (see main.go's classifyMediaCode) -- lets a
+# caller distinguish "this message just isn't downloadable" (not_media,
+# expired, incomplete) from "the bridge itself is unreachable/broken"
+# (offline, internal) instead of the old blanket "Failed to download media".
+_DOWNLOAD_CODE_MESSAGES = {
+    "not_media": "Message has no media attached",
+    "expired": "Media has expired and can no longer be downloaded from WhatsApp's servers",
+    "incomplete": "Message is missing the media metadata required to download it",
+    "offline": "WhatsApp bridge is not connected",
+    "internal": "Bridge failed to download media",
+}
+
+
+def download_media(message_id: str, chat_jid: str) -> Tuple[bool, str, Optional[str]]:
+    """Download media from a message.
+
     Args:
         message_id: The ID of the message containing the media
         chat_jid: The JID of the chat containing the message
-    
+
     Returns:
-        The local file path if download was successful, None otherwise
+        (success, message, path) -- path is the local file path on
+        success, None otherwise. `message` is a human-readable outcome
+        derived from the bridge's `code` field where available (see
+        _DOWNLOAD_CODE_MESSAGES), following the same (success, message)
+        convention as send_message/send_file/send_audio_message in this
+        file, rather than collapsing every failure to a bare None as
+        before.
     """
     try:
         url = f"{WHATSAPP_API_BASE_URL}/download"
@@ -795,28 +815,31 @@ def download_media(message_id: str, chat_jid: str) -> Optional[str]:
             "message_id": message_id,
             "chat_jid": chat_jid
         }
-        
+
         response = requests.post(url, json=payload, timeout=_REQUEST_TIMEOUT)
-        
-        if response.status_code == 200:
+
+        try:
             result = response.json()
-            if result.get("success", False):
-                path = result.get("path")
-                print(f"Media downloaded successfully: {path}", file=sys.stderr)
-                return path
-            else:
-                print(f"Download failed: {result.get('message', 'Unknown error')}", file=sys.stderr)
-                return None
-        else:
-            print(f"Error: HTTP {response.status_code} - {response.text}", file=sys.stderr)
-            return None
+        except json.JSONDecodeError:
+            msg = f"Error: HTTP {response.status_code} - {response.text}"
+            print(msg, file=sys.stderr)
+            return False, msg, None
+
+        if result.get("success", False):
+            path = result.get("path")
+            print(f"Media downloaded successfully: {path}", file=sys.stderr)
+            return True, result.get("message", "Media downloaded successfully"), path
+
+        code = result.get("code")
+        msg = _DOWNLOAD_CODE_MESSAGES.get(code, result.get("message", "Failed to download media"))
+        print(f"Download failed ({code or 'unknown'}): {msg}", file=sys.stderr)
+        return False, msg, None
             
     except requests.RequestException as e:
-        print(f"Request error: {str(e)}", file=sys.stderr)
-        return None
-    except json.JSONDecodeError:
-        print(f"Error parsing response: {response.text}", file=sys.stderr)
-        return None
+        msg = f"Request error: {str(e)}"
+        print(msg, file=sys.stderr)
+        return False, msg, None
     except Exception as e:
-        print(f"Unexpected error: {str(e)}", file=sys.stderr)
-        return None
+        msg = f"Unexpected error: {str(e)}"
+        print(msg, file=sys.stderr)
+        return False, msg, None
