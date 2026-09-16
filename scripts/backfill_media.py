@@ -93,6 +93,30 @@ def _connect_state() -> sqlite3.Connection:
     return conn
 
 
+def explicit_candidates(msg_conn: sqlite3.Connection, pairs: list[tuple[str, str]]) -> list[tuple[str, str, str, int]]:
+    """Returns (id, chat_jid, media_type, file_length) for exactly the
+    given (chat_jid, message_id) pairs that actually have media -- used
+    by --stdin-ids (the on-read trigger from whatsapp.py's list_messages/
+    get_message_context/get_last_interaction), as opposed to
+    eligible_candidates' time-windowed bulk sweep. No age window: these
+    are specific messages someone just read, not a historical scan."""
+    placeholders = ",".join("?" for _ in MEDIA_TYPES)
+    out = []
+    for chat_jid, message_id in pairs:
+        row = msg_conn.execute(
+            f"""SELECT id, chat_jid, media_type, file_length
+                FROM messages
+                WHERE chat_jid = ? AND id = ?
+                  AND media_type IN ({placeholders})
+                  AND url IS NOT NULL AND url != ''
+                  AND file_length > 0""",
+            (chat_jid, message_id, *MEDIA_TYPES),
+        ).fetchone()
+        if row:
+            out.append(row)
+    return out
+
+
 def eligible_candidates(msg_conn: sqlite3.Connection, window_days: int) -> list[tuple[str, str, str, int]]:
     """Returns (id, chat_jid, media_type, file_length) for every message
     with media, a real URL, and a timestamp inside the eligibility window
@@ -209,9 +233,16 @@ def dry_run_report(msg_conn: sqlite3.Connection, state_conn: sqlite3.Connection,
         sys.exit(1)
 
 
-def run_backfill(msg_conn: sqlite3.Connection, state_conn: sqlite3.Connection, window_days: int,
-                  rate_limit_seconds: float, limit: int | None) -> None:
-    candidates = eligible_candidates(msg_conn, window_days)
+def run_backfill(candidates: list[tuple[str, str, str, int]], state_conn: sqlite3.Connection,
+                  rate_limit_seconds: float, limit: int | None, quiet: bool = False) -> dict:
+    """Shared attempt loop for both the bulk time-windowed sweep
+    (--dry-run's real counterpart) and the on-read trigger (--stdin-ids,
+    called from whatsapp.py whenever a chat is actually read -- see the
+    'Whenever a chat/message is read via MCP' decision in the plan file).
+    `quiet` suppresses progress lines for the on-read trigger, which runs
+    detached/unattended and shouldn't be writing to a terminal no one is
+    watching."""
+    _print = (lambda *a, **kw: None) if quiet else print
     attempted = 0
     archived = 0
     terminal = 0
@@ -219,7 +250,7 @@ def run_backfill(msg_conn: sqlite3.Connection, state_conn: sqlite3.Connection, w
 
     for message_id, chat_jid, media_type, file_length in candidates:
         if limit is not None and attempted >= limit:
-            print(f"Reached --limit {limit}, stopping.")
+            _print(f"Reached --limit {limit}, stopping.")
             break
 
         resolved = already_resolved(state_conn, chat_jid, message_id)
@@ -234,23 +265,31 @@ def run_backfill(msg_conn: sqlite3.Connection, state_conn: sqlite3.Connection, w
         if resp.get("success"):
             record(state_conn, chat_jid, message_id, "archived", code, message)
             archived += 1
-            print(f"[{attempted}] OK      {media_type:9s} {file_length/1024:.0f}KB  {chat_jid}/{message_id}")
+            _print(f"[{attempted}] OK      {media_type:9s} {file_length/1024:.0f}KB  {chat_jid}/{message_id}")
         elif code in TERMINAL_CODES:
             record(state_conn, chat_jid, message_id, "terminal", code, message)
             terminal += 1
-            print(f"[{attempted}] {code.upper():9s} {chat_jid}/{message_id}: {message}")
+            _print(f"[{attempted}] {code.upper():9s} {chat_jid}/{message_id}: {message}")
         else:
             record(state_conn, chat_jid, message_id, "transient_failed", code, message)
             transient += 1
-            print(f"[{attempted}] RETRY   {code}: {chat_jid}/{message_id}: {message}", file=sys.stderr)
+            if not quiet:
+                print(f"[{attempted}] RETRY   {code}: {chat_jid}/{message_id}: {message}", file=sys.stderr)
             if code == "offline":
-                print("Bridge is offline -- stopping this run early (will resume on next invocation).", file=sys.stderr)
+                if not quiet:
+                    print("Bridge is offline -- stopping this run early (will resume on next invocation).", file=sys.stderr)
                 break
 
+        # Codex-flagged design (2026-09-15, applied here too): rate-limit
+        # EVERY HTTP attempt, including on-read triggers -- a chat read
+        # that surfaces 20 media messages must not turn into 20 rapid
+        # requests just because it came from a different call site than
+        # the bulk sweep.
         time.sleep(rate_limit_seconds)
 
-    print()
-    print(f"=== Run summary: {attempted} attempted, {archived} archived, {terminal} newly terminal, {transient} transient (will retry) ===")
+    _print()
+    _print(f"=== Run summary: {attempted} attempted, {archived} archived, {terminal} newly terminal, {transient} transient (will retry) ===")
+    return {"attempted": attempted, "archived": archived, "terminal": terminal, "transient": transient}
 
 
 def main() -> int:
@@ -259,6 +298,15 @@ def main() -> int:
     ap.add_argument("--window-days", type=int, default=DEFAULT_WINDOW_DAYS, help=f"Eligibility window (default {DEFAULT_WINDOW_DAYS}).")
     ap.add_argument("--rate-limit-seconds", type=float, default=DEFAULT_RATE_LIMIT_SECONDS, help=f"Delay between requests (default {DEFAULT_RATE_LIMIT_SECONDS}).")
     ap.add_argument("--limit", type=int, default=None, help="Cap the number of NEW attempts this run.")
+    ap.add_argument(
+        "--stdin-ids", action="store_true",
+        help="On-read trigger mode: read a JSON array of [chat_jid, message_id] pairs from "
+             "stdin and attempt to archive exactly those (no age window -- these are specific "
+             "messages a caller just read, e.g. from whatsapp.py's list_messages/"
+             "get_message_context/get_last_interaction). Runs quietly (see --quiet) since this "
+             "mode is meant to be spawned detached, with nothing watching its stdout.",
+    )
+    ap.add_argument("--quiet", action="store_true", help="Suppress progress lines (implied by --stdin-ids).")
     args = ap.parse_args()
 
     if not MESSAGES_DB.exists():
@@ -270,8 +318,17 @@ def main() -> int:
 
     if args.dry_run:
         dry_run_report(msg_conn, state_conn, args.window_days)
+    elif args.stdin_ids:
+        try:
+            pairs = json.load(sys.stdin)
+        except (json.JSONDecodeError, ValueError) as e:
+            print(f"--stdin-ids: invalid JSON on stdin: {e}", file=sys.stderr)
+            return 1
+        candidates = explicit_candidates(msg_conn, [tuple(p) for p in pairs])
+        run_backfill(candidates, state_conn, args.rate_limit_seconds, args.limit, quiet=True)
     else:
-        run_backfill(msg_conn, state_conn, args.window_days, args.rate_limit_seconds, args.limit)
+        candidates = eligible_candidates(msg_conn, args.window_days)
+        run_backfill(candidates, state_conn, args.rate_limit_seconds, args.limit, quiet=args.quiet)
     return 0
 
 

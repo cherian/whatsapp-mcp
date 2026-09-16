@@ -1,4 +1,5 @@
 import os
+import subprocess
 import sqlite3
 import sys
 from datetime import datetime
@@ -59,6 +60,43 @@ def _message_to_dict(m: "Message") -> dict:
         "is_from_me": m.is_from_me,
         "media_type": m.media_type,
     }
+
+
+_BACKFILL_SCRIPT = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "..", "scripts", "backfill_media.py"
+)
+
+
+def _trigger_archive_for_media(messages: List["Message"]) -> None:
+    """Fire-and-forget: whenever a chat is actually read (list_messages,
+    get_message_context, get_last_interaction), opportunistically archive
+    any media in that response before it can expire.
+
+    Deliberately scoped to whatsapp-mcp-server only -- chat-synopsis (a
+    separate project, currently mid-trial) is a different codebase and
+    reads messages.db independently; touching it is a distinct, later
+    decision, not something this hook reaches into.
+
+    Spawned as a detached subprocess (scripts/backfill_media.py
+    --stdin-ids, which already owns its own state db and rate limiting)
+    rather than done in-process, so a slow or failing archive attempt can
+    never add latency to, or raise out of, the read path that triggered
+    it. Best-effort: any failure to even spawn the subprocess is swallowed
+    -- an MCP read must never fail because archiving couldn't start."""
+    pairs = list({(m.chat_jid, m.id) for m in messages if m.media_type})
+    if not pairs:
+        return
+    try:
+        proc = subprocess.Popen(
+            [sys.executable, _BACKFILL_SCRIPT, "--stdin-ids"],
+            stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        proc.stdin.write(json.dumps(pairs).encode())
+        proc.stdin.close()
+    except Exception as e:
+        print(f"Failed to trigger media archive: {e}", file=sys.stderr)
+
 
 @dataclass
 class Chat:
@@ -234,18 +272,21 @@ def list_messages(
             # Add context for each message
             messages_with_context = []
             for msg in result:
+                # get_message_context triggers its own archive attempt for
+                # target_message + before/after -- not duplicated here.
                 context = get_message_context(msg.id, context_before, context_after)
                 messages_with_context.extend(context.before)
                 messages_with_context.append(context.message)
                 messages_with_context.extend(context.after)
-            
+
             return [_message_to_dict(m) for m in messages_with_context]
-            
+
         # Structured records, not a formatted string -- this is what the
         # `list_messages` MCP tool's declared List[Dict[str, Any]] return
         # type in main.py actually promised, and what the chat-synopsis
         # adapter requires.
-        return [_message_to_dict(m) for m in result]    
+        _trigger_archive_for_media(result)
+        return [_message_to_dict(m) for m in result]
         
     except sqlite3.Error as e:
         print(f"Database error: {e}", file=sys.stderr)
@@ -333,7 +374,8 @@ def get_message_context(
                 id=msg[6],
                 media_type=msg[7]
             ))
-        
+
+        _trigger_archive_for_media([target_message, *before_messages, *after_messages])
         return MessageContext(
             message=target_message,
             before=before_messages,
@@ -566,7 +608,8 @@ def get_last_interaction(jid: str) -> str:
             id=msg_data[6],
             media_type=msg_data[7]
         )
-        
+
+        _trigger_archive_for_media([message])
         return format_message(message)
         
     except sqlite3.Error as e:
