@@ -94,3 +94,54 @@ for the current signature rather than guessing. Do not pair on a version
 that only *compiles* — WhatsApp actively rejects companion clients running
 stale library versions with an outright connection failure, so the real
 test is a successful QR pairing, not just `go build`.
+
+## Day-30 cutover (WhatsApp into the main chat-synopsis DB)
+
+The day-30 launch job (`whatsapp-phase2-launch.py`, run daily by its own LaunchAgent) only
+computes the trial
+verdict and nags. The cutover itself is run by hand from a terminal, and it
+does one thing: it merges the WhatsApp trial DB
+(`~/.local/share/chat-synopsis-whatsapp/cache.db.nosync`) into the main DB
+(`~/.local/share/telegram-synopsis/cache.db.nosync`). The CLI and the `/chat`
+skill were already updated outside this job; the cutover does not touch them.
+
+    /usr/bin/python3 ~/.claude/scheduled-scripts/whatsapp-phase2-launch.py --cutover
+
+It runs a dry merge, shows the per-table counts, and waits for you to type
+`LAUNCH`. Then it backs up the main DB, merges with the pinned Phase 2
+binary, writes the `whatsapp-merge-completed` marker (which lets
+`--channel whatsapp` use the main DB), and smoke-tests the live CLI. If the
+smoke fails, it restores the backup on its own.
+
+Phases you can see in `~/.local/share/whatsapp-bridge/phase2-launch-state.json`:
+
+| Phase | Meaning | What to do |
+|---|---|---|
+| `verdict_ready` | Trial passed, cutover not run yet | Run `--cutover` |
+| `launching` | A cutover stopped mid-way | Run `--cutover`, type `RESUME` |
+| `launched` | Merged and smoke-tested | Edit the `/chat` skill first (below), then run `/chat --channel whatsapp <name>`; that acknowledges it and the job disables itself |
+| `launch_failed` | The merge did not commit; nothing changed | Fix the cause, run `--cutover` again |
+| `rollback_in_progress` | A restore stopped mid-way | Run `--cutover`, type `RESUME` |
+| `restore_done` | The merge was rolled back cleanly | Fix the cause, run `--cutover` again |
+| `rollback_failed` | The restore refused or failed | Read the notification, then use `--restore` |
+
+The `/chat` skill decides which DB WhatsApp uses. Its WhatsApp section
+(`claude-code-skill/chat/SKILL.md` in the chat-synopsis checkout) sets
+`CHAT_DATA_DIR=~/.local/share/chat-synopsis-whatsapp` for the isolated trial.
+After `launched`, remove that line so `/chat` uses the main DB. Until you do,
+`/chat` keeps writing to the frozen trial archive and never acknowledges the
+launch. After `restore_done` (or any restore), the line must be there again,
+because WhatsApp is back on the isolated trial DB.
+
+Manual restore of the pre-merge backup (needs a terminal and a typed
+`RESTORE`):
+
+    /usr/bin/python3 ~/.claude/scheduled-scripts/whatsapp-phase2-launch.py --restore
+
+The restore refuses when the main DB's non-WhatsApp data changed after the
+merge (for example, a Telegram pin or synopsis written later), because
+restoring would delete that data. Reconcile by hand in that case. After
+`launched`, treat the merge as one-way: the backup
+(`~/.local/share/whatsapp-bridge/backups/cache.db.nosync.pre-merge-<op_id>`)
+is kept indefinitely, but a restore drops everything written since. Never
+delete the state file to re-run the merge.
