@@ -328,6 +328,22 @@ type SendMessageRequest struct {
 	MediaPath string `json:"media_path,omitempty"`
 }
 
+func buildDocumentMessage(mediaPath, mimeType, caption string, resp whatsmeow.UploadResponse) *waProto.DocumentMessage {
+	filename := filepath.Base(mediaPath)
+	return &waProto.DocumentMessage{
+		Title:         proto.String(filename),
+		FileName:      proto.String(filename),
+		Caption:       proto.String(caption),
+		Mimetype:      proto.String(mimeType),
+		URL:           &resp.URL,
+		DirectPath:    &resp.DirectPath,
+		MediaKey:      resp.MediaKey,
+		FileEncSHA256: resp.FileEncSHA256,
+		FileSHA256:    resp.FileSHA256,
+		FileLength:    &resp.FileLength,
+	}
+}
+
 // Function to send a WhatsApp message
 func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, recipient string, message string, mediaPath string) (bool, string) {
 	if !client.IsConnected() {
@@ -471,17 +487,7 @@ func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, r
 				FileLength:    &resp.FileLength,
 			}
 		case whatsmeow.MediaDocument:
-			msg.DocumentMessage = &waProto.DocumentMessage{
-				Title:         proto.String(mediaPath[strings.LastIndex(mediaPath, "/")+1:]),
-				Caption:       proto.String(message),
-				Mimetype:      proto.String(mimeType),
-				URL:           &resp.URL,
-				DirectPath:    &resp.DirectPath,
-				MediaKey:      resp.MediaKey,
-				FileEncSHA256: resp.FileEncSHA256,
-				FileSHA256:    resp.FileSHA256,
-				FileLength:    &resp.FileLength,
-			}
+			msg.DocumentMessage = buildDocumentMessage(mediaPath, mimeType, message, resp)
 		}
 	} else {
 		msg.Conversation = proto.String(message)
